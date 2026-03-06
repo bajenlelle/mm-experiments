@@ -1,24 +1,22 @@
 """
-Basketball pose estimation + ByteTrack player tracking
-Uses RTMDet-m (detection) + RTMPose-m (17 COCO keypoints) + supervision ByteTrack
+Basketball pose estimation + BoT-SORT player tracking
+Uses RTMDet-m (detection) + RTMPose-m (17 COCO keypoints) + ultralytics BoT-SORT
 
 Usage: python run_mmpose_track.py <video_path>
        python run_mmpose_track.py ../data/videos/djurgarden1.mp4
        python run_mmpose_track.py ../data/videos/djurgarden1.mp4 --debug
        python run_mmpose_track.py ../data/videos/djurgarden1.mp4 --debug --verbose
-       python run_mmpose_track.py ../data/videos/djurgarden1.mp4 --court
 """
 import argparse
-import os
 from pathlib import Path
 import time
-
-from dotenv import load_dotenv
 
 import cv2
 import numpy as np
 import torch
-import supervision as sv
+from ultralytics.trackers.bot_sort import BOTSORT
+from ultralytics.trackers.basetrack import BaseTrack
+from ultralytics.utils import IterableSimpleNamespace
 from mmpose.apis import MMPoseInferencer
 
 
@@ -52,71 +50,6 @@ def _patch_for_mps():
     ]
 
 
-# ── Court filtering helpers ───────────────────────────────────────────────────
-
-def _load_court_model():
-    """Load Roboflow court keypoint model + court config. Returns (model, court_config)."""
-    load_dotenv(Path(__file__).parent.parent / '.env')
-    from inference import get_model
-    from sports.basketball import CourtConfiguration, League
-    from sports import MeasurementUnit
-
-    model = get_model(model_id='basketball-court-detection-2-nsbav/3')
-    config = CourtConfiguration(league=League.NBA, measurement_unit=MeasurementUnit.FEET)
-    return model, config
-
-
-def _compute_court_polygon(frame, model, court_config):
-    """
-    Returns court boundary as (N,1,2) int32 array in pixel coords, or None if failed.
-    """
-    import supervision as sv
-    result = model.infer(frame, confidence=0.3)[0]
-    kp = sv.KeyPoints.from_inference(result)
-    if kp.xy.shape[1] == 0:
-        return None
-
-    mask = kp.confidence[0] > 0.5
-    frame_pts = kp.xy[0][mask]                           # (K, 2) in pixels
-    court_pts = np.array(court_config.vertices)[mask]    # (K, 2) in feet
-
-    if mask.sum() >= 4:
-        # Inverse homography: court feet → frame pixels
-        H, _ = cv2.findHomography(
-            court_pts.astype(np.float32),
-            frame_pts.astype(np.float32)
-        )
-        if H is None:
-            hull = cv2.convexHull(frame_pts.astype(np.float32))
-            return hull.astype(np.int32)
-
-        # Project all court vertices into image space
-        all_court_verts = np.array(court_config.vertices, dtype=np.float32)
-        all_court_verts = all_court_verts.reshape(-1, 1, 2)
-        image_verts = cv2.perspectiveTransform(all_court_verts, H)
-        hull = cv2.convexHull(image_verts.reshape(-1, 2))
-        return hull.astype(np.int32)
-
-    elif mask.sum() >= 3:
-        hull = cv2.convexHull(frame_pts.astype(np.float32))
-        return hull.astype(np.int32)
-
-    return None
-
-
-def _filter_by_court(xyxy, conf, polygon):
-    """Keep only detections whose foot point is inside the court polygon."""
-    if polygon is None or len(xyxy) == 0:
-        return xyxy, conf
-    foot_x = (xyxy[:, 0] + xyxy[:, 2]) / 2
-    foot_y = xyxy[:, 3]
-    keep = np.array([
-        cv2.pointPolygonTest(polygon, (float(x), float(y)), False) >= 0
-        for x, y in zip(foot_x, foot_y)
-    ], dtype=bool)
-    return xyxy[keep], conf[keep]
-
-
 # ── Debug helpers ─────────────────────────────────────────────────────────────
 
 def _bbox_iou(box, boxes):
@@ -136,14 +69,12 @@ def _bbox_iou(box, boxes):
 def _pred_tlbr(mean):
     """Apply 1-step constant-velocity model to get predicted xyxy.
 
-    Kalman state: [cx, cy, a, h, vcx, vcy, va, vh]
+    Kalman state (KalmanFilterXYWH): [cx, cy, w, h, vcx, vcy, vw, vh]
     """
     cx = mean[0] + mean[4]
     cy = mean[1] + mean[5]
-    a  = mean[2] + mean[6]
-    h  = mean[3] + mean[7]
-    h  = max(float(h), 1e-6)
-    w  = float(a) * h
+    w  = max(float(mean[2] + mean[6]), 1e-6)
+    h  = max(float(mean[3] + mean[7]), 1e-6)
     return np.array([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], dtype=np.float32)
 
 
@@ -151,14 +82,14 @@ def _snapshot_tracks(tracks):
     """Capture per-track debug info before update."""
     info = {}
     for t in tracks:
-        eid = t.external_track_id
+        eid = t.track_id
         if t.mean is None:
             continue
         info[eid] = {
-            'tlbr':      t.tlbr.copy(),
+            'tlbr':      t.xyxy.copy(),
             'pred_tlbr': _pred_tlbr(t.mean),
             'vel':       t.mean[4:6].copy(),
-            'state':     t.state.name,
+            'state':     'Tracked' if t.is_activated else 'Lost',
             'last_seen': t.frame_id,
             'age':       t.frame_id - t.start_frame,
         }
@@ -167,8 +98,8 @@ def _snapshot_tracks(tracks):
 
 def _print_debug(frame_count, fps, xyxy, conf, pre_snap, pre_tracked_ids,
                  tracker, verbose):
-    """Print per-frame debug block after tracker.update_with_detections()."""
-    post_tracked_ids = {t.external_track_id for t in tracker.tracked_tracks} - {-1}
+    """Print per-frame debug block after tracker.update()."""
+    post_tracked_ids = {t.track_id for t in tracker.tracked_stracks} - {-1}
     new_track_ids    = post_tracked_ids - pre_tracked_ids
     newly_lost_ids   = pre_tracked_ids - post_tracked_ids
 
@@ -177,8 +108,7 @@ def _print_debug(frame_count, fps, xyxy, conf, pre_snap, pre_tracked_ids,
         return
 
     t_s = frame_count / fps
-    total_ids = getattr(tracker.external_id_counter, '_count',
-                getattr(tracker.external_id_counter, '_id', '?'))
+    total_ids = BaseTrack._count
 
     print(f"\n=== Frame {frame_count} (t={t_s:.1f}s) ===")
 
@@ -256,20 +186,40 @@ def _print_debug(frame_count, fps, xyxy, conf, pre_snap, pre_tracked_ids,
     print(f"  Total external IDs created so far: {total_ids}")
 
 
+# ── Detection wrapper ─────────────────────────────────────────────────────────
+
+class _Dets:
+    """Minimal subscriptable detections object for BOTSORT.update()."""
+    def __init__(self, xyxy, conf):
+        self.xyxy = xyxy
+        self.conf = conf
+        self.cls  = np.zeros(len(conf), dtype=np.float32)
+        xywh = xyxy.copy()
+        xywh[:, 0] = (xyxy[:, 0] + xyxy[:, 2]) / 2
+        xywh[:, 1] = (xyxy[:, 1] + xyxy[:, 3]) / 2
+        xywh[:, 2] = xyxy[:, 2] - xyxy[:, 0]
+        xywh[:, 3] = xyxy[:, 3] - xyxy[:, 1]
+        self.xywh = xywh
+
+    def __len__(self):
+        return len(self.conf)
+
+    def __getitem__(self, idx):
+        return _Dets(self.xyxy[idx], self.conf[idx])
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     # ── Args ──────────────────────────────────────────────────────────────────
     parser = argparse.ArgumentParser(
-        description='Basketball pose estimation + ByteTrack tracking')
+        description='Basketball pose estimation + BoT-SORT tracking')
     parser.add_argument('video_path', type=Path,
                         help='Path to input video')
     parser.add_argument('--debug', action='store_true',
                         help='Print debug info when a track is created or lost')
     parser.add_argument('--verbose', action='store_true',
                         help='Print full per-frame IoU matrix (implies --debug)')
-    parser.add_argument('--court', action='store_true',
-                        help='Filter detections to inside-court area using Roboflow keypoint model')
     args = parser.parse_args()
 
     video_path = args.video_path
@@ -291,23 +241,6 @@ def main():
     print("Initializing RTMDet-m + RTMPose-m ...")
     inferencer = MMPoseInferencer(pose2d='human', device=device)
 
-    # ── ByteTrack init ────────────────────────────────────────────────────────
-    tracker = sv.ByteTrack(
-        track_activation_threshold=0.25,  # restored: court filtering handles noise suppression
-        lost_track_buffer=30,
-        minimum_matching_threshold=0.8,   # restored
-        frame_rate=30,
-    )
-
-    # ── Court model init ──────────────────────────────────────────────────────
-    if args.court:
-        print("Loading court keypoint model...")
-        court_model, court_cfg = _load_court_model()
-        court_polygon = None           # computed on first frame
-        COURT_UPDATE_INTERVAL = 150    # refresh every ~6s at 30fps
-    else:
-        court_model = court_cfg = court_polygon = None
-
     # ── Video I/O ─────────────────────────────────────────────────────────────
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -326,6 +259,22 @@ def main():
 
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     writer = cv2.VideoWriter(str(out_path), fourcc, fps, (w, h))
+
+    # ── BoT-SORT init ────────────────────────────────────────────────────────
+    botsort_args = IterableSimpleNamespace(
+        track_high_thresh=0.25,      # min conf to promote to active track
+        track_low_thresh=0.1,        # min conf for low-score second-stage match
+        new_track_thresh=0.4,        # was 0.25 — require more confidence to spawn new track
+        track_buffer=90,             # was 30 — keep lost tracks alive ~3.6s at 25fps
+        match_thresh=0.7,            # was 0.8 — stricter IoU, reduces cross-player theft
+        gmc_method='sparseOptFlow',  # global motion compensation (handles panning)
+        proximity_thresh=0.5,        # appearance matching only when IoU dist < 0.5
+        appearance_thresh=0.25,      # block embeddings with cosine dist > 0.75
+        with_reid=True,              # enable appearance-based ReID
+        fuse_score=False,            # do not fuse score into IoU distance
+        model='yolo26n-cls.pt',      # explicit nano classifier (~5MB, auto-downloaded)
+    )
+    tracker = BOTSORT(args=botsort_args, frame_rate=fps)
 
     print(f"\nProcessing: {video_path.name}  ({w}x{h} @ {fps:.1f} fps, {total_frames} frames)")
     print(f"Output: {out_path}")
@@ -371,7 +320,7 @@ def main():
                 print(f"  Frame {frame_count}/{total_frames}  {frame_count/elapsed:.1f} fps")
             continue
 
-        # ── Build sv.Detections from MMPose output ────────────────────────────
+        # ── Build detections from MMPose output ───────────────────────────────
         xyxy = np.array([inst['bbox'][0] for inst in instances], dtype=np.float32)  # (N, 4)
         conf = np.array([inst['bbox_score'] for inst in instances], dtype=np.float32)  # (N,)
 
@@ -379,37 +328,17 @@ def main():
             writer.write(annotated)
             continue
 
-        detections = sv.Detections(xyxy=xyxy, confidence=conf)
-
-        # ── Court polygon refresh ─────────────────────────────────────────────
-        if args.court and (court_polygon is None or frame_count % COURT_UPDATE_INTERVAL == 1):
-            new_poly = _compute_court_polygon(frame_rgb, court_model, court_cfg)
-            if new_poly is not None:
-                court_polygon = new_poly
-                if debug:
-                    print(f"  [court] polygon updated ({len(new_poly)} pts)")
-            elif court_polygon is None and debug:
-                print(f"  [court] WARNING: no polygon on frame {frame_count}")
-
-        # ── Filter detections to court area ───────────────────────────────────
-        if args.court and court_polygon is not None:
-            xyxy, conf = _filter_by_court(xyxy, conf, court_polygon)
-            if len(xyxy) == 0:
-                if args.court and court_polygon is not None:
-                    cv2.polylines(annotated, [court_polygon], isClosed=True,
-                                  color=(0, 255, 0), thickness=2)
-                writer.write(annotated)
-                continue
-            detections = sv.Detections(xyxy=xyxy, confidence=conf)
+        dets = _Dets(xyxy, conf)
 
         # ── Debug: snapshot tracker state before update ───────────────────────
         if debug:
-            pre_tracked_ids = {t.external_track_id for t in tracker.tracked_tracks} - {-1}
+            pre_tracked_ids = {t.track_id for t in tracker.tracked_stracks} - {-1}
             pre_snap = _snapshot_tracks(
-                list(tracker.tracked_tracks) + list(tracker.lost_tracks))
+                list(tracker.tracked_stracks) + list(tracker.lost_stracks))
 
-        # ── ByteTrack update ──────────────────────────────────────────────────
-        tracked = tracker.update_with_detections(detections)
+        # ── BoT-SORT update ───────────────────────────────────────────────────
+        tracks = tracker.update(dets, img=frame_bgr)
+        # tracks: np.ndarray shape (M, 8) → [x1,y1,x2,y2, track_id, conf, cls, idx]
 
         # ── Debug: print events after update ──────────────────────────────────
         if debug:
@@ -417,31 +346,22 @@ def main():
                          pre_tracked_ids, tracker, verbose)
 
         # ── Draw tracking boxes + IDs on top of MMPose skeleton frame ────────
-        for box, tid in zip(tracked.xyxy, tracked.tracker_id):
-            if tid is None:
-                continue
-
+        for row in tracks:
+            x1, y1, x2, y2, tid = int(row[0]), int(row[1]), int(row[2]), int(row[3]), int(row[4])
             color = PALETTE[tid % len(PALETTE)]
-            x1, y1, x2, y2 = map(int, box)
             cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
-
             label = f"#{tid}"
             (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
             cv2.rectangle(annotated, (x1, y1 - th - 8), (x1 + tw + 6, y1), color, -1)
             cv2.putText(annotated, label, (x1 + 3, y1 - 4),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
 
-        # ── Draw court outline for visual verification ────────────────────────
-        if args.court and court_polygon is not None:
-            cv2.polylines(annotated, [court_polygon], isClosed=True,
-                          color=(0, 255, 0), thickness=2)
-
         writer.write(annotated)
 
         if frame_count % 30 == 0:
             elapsed = time.time() - t_start
             print(f"  Frame {frame_count}/{total_frames}  {frame_count/elapsed:.1f} fps  "
-                  f"active tracks: {len(tracked)}")
+                  f"active tracks: {len(tracks)}")
 
     # ── Cleanup ───────────────────────────────────────────────────────────────
     cap.release()
